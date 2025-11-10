@@ -1,0 +1,1273 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nachiket Dabhade - Data Engineer Portfolio</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background-color: #141414;
+            color: #fff;
+            overflow-x: hidden;
+        }
+
+        .navbar {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            padding: 20px 50px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 1000;
+            background: linear-gradient(180deg, rgba(0,0,0,0.7) 10%, transparent);
+            transition: background 0.3s;
+        }
+
+        .navbar.scrolled {
+            background: #141414;
+        }
+
+        .logo {
+            font-size: 32px;
+            font-weight: 900;
+            color: #e50914;
+            letter-spacing: -2px;
+            font-family: Impact, 'Arial Black', sans-serif;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 30px;
+        }
+
+        .nav-links a {
+            color: #fff;
+            text-decoration: none;
+            font-size: 14px;
+            transition: color 0.3s;
+        }
+
+        .nav-links a:hover {
+            color: #e50914;
+        }
+
+        .hero {
+            position: relative;
+            height: 100vh;
+            background: linear-gradient(rgba(0,0,0,0.6), rgba(20,20,20,0.95)), 
+                        url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080"><defs><linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:%23e50914;stop-opacity:0.1"/><stop offset="100%" style="stop-color:%23831010;stop-opacity:0.05"/></linearGradient><pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse"><path d="M 60 0 L 0 0 0 60" fill="none" stroke="%23e50914" stroke-width="0.5" opacity="0.1"/></pattern></defs><rect width="1920" height="1080" fill="%23000"/><rect width="1920" height="1080" fill="url(%23grad1)"/><rect width="1920" height="1080" fill="url(%23grid)"/><g opacity="0.3"><circle cx="300" cy="200" r="150" fill="none" stroke="%23e50914" stroke-width="2"/><circle cx="300" cy="200" r="100" fill="none" stroke="%23e50914" stroke-width="1.5"/><circle cx="300" cy="200" r="50" fill="none" stroke="%23e50914" stroke-width="1"/></g><g opacity="0.2"><rect x="1400" y="700" width="200" height="200" fill="none" stroke="%23e50914" stroke-width="2" transform="rotate(45 1500 800)"/><rect x="1420" y="720" width="160" height="160" fill="none" stroke="%23e50914" stroke-width="1.5" transform="rotate(45 1500 800)"/></g><g opacity="0.25"><path d="M 800 100 L 900 300 L 1000 100 L 1100 300 L 1200 100" fill="none" stroke="%23e50914" stroke-width="2"/><path d="M 100 600 Q 300 500 500 600 T 900 600" fill="none" stroke="%23e50914" stroke-width="1.5" opacity="0.3"/></g><g fill="%23e50914"><circle cx="1600" cy="300" r="4" opacity="0.6"><animate attributeName="opacity" values="0.3;0.8;0.3" dur="3s" repeatCount="indefinite"/></circle><circle cx="500" cy="800" r="3" opacity="0.5"><animate attributeName="opacity" values="0.2;0.7;0.2" dur="4s" repeatCount="indefinite"/></circle><circle cx="1200" cy="600" r="5" opacity="0.4"><animate attributeName="opacity" values="0.3;0.9;0.3" dur="2.5s" repeatCount="indefinite"/></circle><circle cx="200" cy="400" r="3" opacity="0.5"><animate attributeName="opacity" values="0.2;0.6;0.2" dur="3.5s" repeatCount="indefinite"/></circle></g><g opacity="0.15"><polygon points="1700,900 1750,950 1800,900 1750,850" fill="%23e50914"/><polygon points="400,150 450,200 500,150 450,100" fill="%23e50914"/></g></svg>');
+            background-size: cover;
+            background-position: center;
+            display: flex;
+            align-items: center;
+            padding: 0 50px;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 20% 50%, rgba(229, 9, 20, 0.1) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 80%, rgba(131, 16, 16, 0.1) 0%, transparent 50%);
+            animation: pulseGlow 8s ease-in-out infinite;
+        }
+        
+        @keyframes pulseGlow {
+            0%, 100% {
+                opacity: 0.5;
+            }
+            50% {
+                opacity: 0.8;
+            }
+        }
+
+        .hero-content {
+            max-width: 700px;
+            animation: fadeInUp 1s ease-out;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .loading-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            animation: fadeOut 0.8s ease-out 3.5s forwards;
+        }
+
+        @keyframes fadeOut {
+            to {
+                opacity: 0;
+                visibility: hidden;
+            }
+        }
+
+        .loading-logo {
+            font-size: 120px;
+            font-weight: 900;
+            color: #e50914;
+            letter-spacing: -5px;
+            font-family: Impact, 'Arial Black', sans-serif;
+            position: relative;
+            overflow: hidden;
+            white-space: nowrap;
+        }
+
+        .loading-logo .letter {
+            display: inline-block;
+            opacity: 0;
+        }
+
+        .loading-logo .letter-n {
+            animation: showN 0.5s ease-out 0.3s forwards, scaleN 0.6s ease-in-out 1s forwards;
+            transform-origin: center;
+        }
+
+        .loading-logo .letter-a,
+        .loading-logo .letter-c,
+        .loading-logo .letter-h,
+        .loading-logo .letter-i,
+        .loading-logo .letter-k,
+        .loading-logo .letter-e,
+        .loading-logo .letter-t {
+            animation: expandLetters 0.8s ease-out 1.8s forwards;
+        }
+
+        @keyframes showN {
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes scaleN {
+            0% {
+                transform: scale(1);
+            }
+            50% {
+                transform: scale(1.3);
+            }
+            100% {
+                transform: scale(1);
+            }
+        }
+
+        @keyframes expandLetters {
+            0% {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            100% {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                transform: scale(1);
+                opacity: 1;
+            }
+            50% {
+                transform: scale(1.1);
+                opacity: 0.8;
+            }
+        }
+
+        .hero h1 {
+            font-size: 64px;
+            font-weight: bold;
+            margin-bottom: 20px;
+            line-height: 1.1;
+        }
+
+        .hero .subtitle {
+            font-size: 24px;
+            margin-bottom: 30px;
+            color: #e5e5e5;
+        }
+
+        .hero .description {
+            font-size: 18px;
+            line-height: 1.6;
+            margin-bottom: 30px;
+            color: #ccc;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 15px;
+        }
+
+        .btn {
+            padding: 15px 30px;
+            font-size: 16px;
+            font-weight: bold;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: #e50914;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #f40612;
+            transform: scale(1.05);
+        }
+
+        .btn-secondary {
+            background: rgba(109, 109, 110, 0.7);
+            color: #fff;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(109, 109, 110, 0.9);
+        }
+
+        .section {
+            padding: 60px 50px;
+        }
+
+        .section-title {
+            font-size: 28px;
+            margin-bottom: 30px;
+            font-weight: bold;
+        }
+
+        .cards-container {
+            display: flex;
+            gap: 20px;
+            overflow-x: auto;
+            padding-bottom: 20px;
+            scrollbar-width: thin;
+            scrollbar-color: #e50914 #141414;
+        }
+
+        .cards-container::-webkit-scrollbar {
+            height: 8px;
+        }
+
+        .cards-container::-webkit-scrollbar-track {
+            background: #141414;
+        }
+
+        .cards-container::-webkit-scrollbar-thumb {
+            background: #e50914;
+            border-radius: 4px;
+        }
+
+        .card {
+            min-width: 300px;
+            background: #1f1f1f;
+            border-radius: 8px;
+            overflow: hidden;
+            transition: transform 0.3s, box-shadow 0.3s;
+            cursor: pointer;
+        }
+
+        .card:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(229, 9, 20, 0.3);
+        }
+
+        .card-image {
+            width: 100%;
+            height: 180px;
+            background: linear-gradient(135deg, #e50914 0%, #831010 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 48px;
+            font-weight: bold;
+            color: rgba(255,255,255,0.9);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card-image::before {
+            content: '';
+            position: absolute;
+            width: 200%;
+            height: 200%;
+            background: repeating-linear-gradient(
+                45deg,
+                transparent,
+                transparent 10px,
+                rgba(255,255,255,0.03) 10px,
+                rgba(255,255,255,0.03) 20px
+            );
+            animation: slidePattern 20s linear infinite;
+        }
+
+        @keyframes slidePattern {
+            0% {
+                transform: translate(-50%, -50%);
+            }
+            100% {
+                transform: translate(0%, 0%);
+            }
+        }
+
+        .card-icon {
+            position: relative;
+            z-index: 1;
+            font-size: 64px;
+            filter: drop-shadow(0 4px 8px rgba(0,0,0,0.3));
+        }
+
+        .card-content {
+            padding: 20px;
+        }
+
+        .card-title {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .card-description {
+            font-size: 14px;
+            line-height: 1.5;
+            color: #b3b3b3;
+        }
+
+        .card-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .tag {
+            background: rgba(229, 9, 20, 0.2);
+            color: #e50914;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+        }
+
+        .experience-card {
+            background: #1f1f1f;
+            border-radius: 8px;
+            padding: 30px;
+            margin-bottom: 20px;
+            border-left: 4px solid #e50914;
+        }
+
+        .experience-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 15px;
+        }
+
+        .experience-title {
+            font-size: 22px;
+            font-weight: bold;
+        }
+
+        .experience-company {
+            color: #e50914;
+            font-size: 18px;
+            margin-bottom: 5px;
+        }
+
+        .experience-date {
+            color: #b3b3b3;
+            font-size: 14px;
+        }
+
+        .experience-description {
+            list-style: none;
+            padding: 0;
+        }
+
+        .experience-description li {
+            padding-left: 20px;
+            margin-bottom: 10px;
+            position: relative;
+            color: #ccc;
+            line-height: 1.6;
+        }
+
+        .experience-description li:before {
+            content: "▹";
+            position: absolute;
+            left: 0;
+            color: #e50914;
+            font-weight: bold;
+        }
+
+        .skills-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .skill-category {
+            background: #1f1f1f;
+            padding: 25px;
+            border-radius: 8px;
+            transition: transform 0.3s;
+        }
+
+        .skill-category:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 16px rgba(229, 9, 20, 0.2);
+        }
+
+        .skill-category h3 {
+            color: #e50914;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .skill-category ul {
+            list-style: none;
+            color: #ccc;
+        }
+
+        .skill-category li {
+            padding: 5px 0;
+            font-size: 14px;
+        }
+
+        .contact-section {
+            text-align: center;
+            padding: 80px 50px;
+            background: linear-gradient(180deg, #141414 0%, #0a0a0a 100%);
+        }
+
+        .contact-links {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+
+        .contact-link {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #fff;
+            text-decoration: none;
+            padding: 15px 25px;
+            background: rgba(229, 9, 20, 0.1);
+            border-radius: 8px;
+            transition: all 0.3s;
+        }
+
+        .contact-link:hover {
+            background: #e50914;
+            transform: translateY(-3px);
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            background: #0a0a0a;
+            color: #666;
+        }
+
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 42px;
+            }
+
+            .hero .subtitle {
+                font-size: 18px;
+            }
+
+            .navbar {
+                padding: 15px 20px;
+            }
+
+            .section {
+                padding: 40px 20px;
+            }
+
+            .nav-links {
+                gap: 15px;
+            }
+
+            .nav-links a {
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="loading-screen">
+        <div class="loading-logo">
+            <span class="letter letter-n">N</span><span class="letter letter-a">ACHIKET</span>
+        </div>
+    </div>
+
+    <nav class="navbar" id="navbar">
+        <div class="logo">ND</div>
+        <div class="nav-links">
+            <a href="#about">About</a>
+            <a href="#experience">Experience</a>
+            <a href="#projects">Projects</a>
+            <a href="#skills">Skills</a>
+            <a href="#contact">Contact</a>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="hero-content">
+            <h1>Nachiket Dabhade</h1>
+            <div class="subtitle">Data Engineer | Data Scientist | Cloud &amp; BI Specialist</div>
+            <p class="description">
+                Transforming raw data into actionable insights with 1.5+ years of experience in ETL pipelines, 
+                Azure cloud computing, and machine learning. Passionate about building scalable data solutions 
+                that drive business impact.
+            </p>
+            <div class="cta-buttons">
+                <a href="#contact" class="btn btn-primary">Get In Touch</a>
+                <a href="#" class="btn btn-secondary" id="downloadResume">Download Resume</a>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="about">
+        <h2 class="section-title">About Me</h2>
+        <div class="experience-card">
+            <p style="line-height: 1.8; color: #e5e5e5; font-size: 16px;">
+                I'm a Data Engineer and Data Scientist currently pursuing my MS in Engineering Science and Data Science 
+                at the University at Buffalo, SUNY. With a strong foundation in ETL pipelines, cloud computing (Azure, AWS, GCP), 
+                and machine learning, I specialize in designing cost-optimized data solutions that streamline operations and 
+                drive strategic decision-making.
+                <br><br>
+                During my time at Tata Consultancy Services, I spearheaded global reporting initiatives, built scalable ETL 
+                pipelines that reduced operational costs by 15%, and developed real-time supply chain solutions for major clients 
+                like Goodyear Tires. I'm proficient in SQL, Python, Power BI, and various Azure services, with hands-on experience 
+                in data warehousing using Snowflake, Redshift, and BigQuery.
+            </p>
+        </div>
+    </section>
+
+    <section class="section" id="experience">
+        <h2 class="section-title">Professional Experience</h2>
+        
+        <div class="experience-card">
+            <div class="experience-header">
+                <div>
+                    <div class="experience-company">Tata Consultancy Services</div>
+                    <div class="experience-title">Technical Representative, Data Engineer</div>
+                </div>
+                <div class="experience-date">Sep 2021 – Jul 2023</div>
+            </div>
+            <ul class="experience-description">
+                <li>Spearheaded global reporting and data optimization initiatives across EMEA, AMER, and APJ, streamlining data assets and management workflows</li>
+                <li>Designed and implemented cost-optimized ETL pipeline leveraging Azure Data Factory, Blob Storage, and Azure Synapse Analytics, achieving 15% reduction in operational costs</li>
+                <li>Developed interactive dashboards using Power BI and SQL for data modeling and visualization, performing detailed region and product-specific analysis</li>
+                <li>Led A/B testing and KPI analysis to refine business intelligence strategies and optimize operational performance</li>
+                <li>Developed critical parts supply chain solution for Goodyear Tires during the pandemic, ensuring operational continuity</li>
+            </ul>
+        </div>
+
+        <div class="experience-card">
+            <div class="experience-header">
+                <div>
+                    <div class="experience-company">Shanti Industrial Services</div>
+                    <div class="experience-title">Technical Representative, Engineer</div>
+                </div>
+                <div class="experience-date">Sep 2020 – Dec 2023</div>
+            </div>
+            <ul class="experience-description">
+                <li>Used project analytics and cost-performance data to optimize resource allocation and reduce material waste</li>
+                <li>Increased production 5x through process optimization; expanded to second plant and grew company turnover from ₹1 Cr to ₹6 Cr</li>
+                <li>Built and managed engineering teams, launched company website, and implemented systems to boost efficiency</li>
+            </ul>
+        </div>
+    </section>
+
+    <section class="section" id="projects">
+        <h2 class="section-title">Featured Projects</h2>
+        <div class="cards-container">
+            <div class="card">
+                <div class="card-image">
+                    <div class="card-icon">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <path d="M12 6v6l4 2"></path>
+                            <path d="M16 3.13a9 9 0 0 1 0 17.74"></path>
+                            <path d="M8 3.13a9 9 0 0 0 0 17.74"></path>
+                        </svg>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-title">Goodyear Tires Supply Chain</div>
+                    <div class="card-description">
+                        Architected a real-time tire components supply chain using Azure Data Factory, Event Hub, 
+                        Stream Analytics, and ADLS Gen2. Streamlined parts visibility across regions, cut manual 
+                        reporting by 40%, and enabled live dashboards.
+                    </div>
+                    <div class="card-tags">
+                        <span class="tag">Azure</span>
+                        <span class="tag">ETL</span>
+                        <span class="tag">Power BI</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-image">
+                    <div class="card-icon">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                            <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                        </svg>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-title">Supply Chain Risk Scoring Engine</div>
+                    <div class="card-description">
+                        Designed a real-time ML analytics system with Python, XGBoost, Kafka, and Hopsworks Feature Store, 
+                        delivering live insights via Streamlit and MLflow for predictive risk assessment.
+                    </div>
+                    <div class="card-tags">
+                        <span class="tag">Python</span>
+                        <span class="tag">XGBoost</span>
+                        <span class="tag">Kafka</span>
+                        <span class="tag">MLflow</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-image">
+                    <div class="card-icon">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M12 1v6m0 6v6"></path>
+                            <path d="M1 12h6m6 0h6"></path>
+                            <path d="m4.93 4.93 4.24 4.24m5.66 5.66 4.24 4.24"></path>
+                            <path d="m19.07 4.93-4.24 4.24m-5.66 5.66-4.24 4.24"></path>
+                        </svg>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-title">Web Scraping Solution</div>
+                    <div class="card-description">
+                        Implemented a Python-based web scraper leveraging NumPy and Pandas to process and clean 
+                        500,000+ data points daily, delivering actionable insights to multiple stakeholders.
+                    </div>
+                    <div class="card-tags">
+                        <span class="tag">Python</span>
+                        <span class="tag">Selenium</span>
+                        <span class="tag">Pandas</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-image">
+                    <div class="card-icon">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+                        </svg>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-title">Heart Disease Prediction</div>
+                    <div class="card-description">
+                        Developed a predictive healthcare model using Logistic Regression &amp; XGBoost, improving 
+                        diagnostic accuracy by 25%. Built HIPAA-compliant data pipeline with MLflow and Streamlit.
+                    </div>
+                    <div class="card-tags">
+                        <span class="tag">Machine Learning</span>
+                        <span class="tag">XGBoost</span>
+                        <span class="tag">Streamlit</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-image">
+                    <div class="card-icon">
+                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="3" y="3" width="7" height="7"></rect>
+                            <rect x="14" y="3" width="7" height="7"></rect>
+                            <rect x="14" y="14" width="7" height="7"></rect>
+                            <rect x="3" y="14" width="7" height="7"></rect>
+                        </svg>
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div class="card-title">Person Re-Identification</div>
+                    <div class="card-description">
+                        Research on facial feature-based person re-identification for surveillance using Python, 
+                        TensorFlow, and OpenCV. Compared CNN, MTCNN, and HOG models with CNN yielding highest accuracy.
+                    </div>
+                    <div class="card-tags">
+                        <span class="tag">Deep Learning</span>
+                        <span class="tag">TensorFlow</span>
+                        <span class="tag">OpenCV</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="skills">
+        <h2 class="section-title">Technical Skills</h2>
+        <div class="skills-grid">
+            <div class="skill-category">
+                <h3>Programming &amp; Scripting</h3>
+                <ul>
+                    <li>Python (Pandas, NumPy, PySpark)</li>
+                    <li>SQL</li>
+                    <li>R, MATLAB</li>
+                    <li>Shell Scripting</li>
+                </ul>
+            </div>
+
+            <div class="skill-category">
+                <h3>Data Science &amp; ML</h3>
+                <ul>
+                    <li>Supervised &amp; Unsupervised Learning</li>
+                    <li>Deep Learning (TensorFlow, PyTorch)</li>
+                    <li>Feature Engineering</li>
+                    <li>Time Series Analysis</li>
+                </ul>
+            </div>
+
+            <div class="skill-category">
+                <h3>Data Engineering</h3>
+                <ul>
+                    <li>ETL Pipelines (ADF, Airflow, Glue)</li>
+                    <li>Big Data (Spark, Databricks, Hadoop)</li>
+                    <li>Streaming (Kafka, Kinesis)</li>
+                    <li>Data Warehousing (Snowflake, Redshift)</li>
+                </ul>
+            </div>
+
+            <div class="skill-category">
+                <h3>Cloud &amp; DevOps</h3>
+                <ul>
+                    <li>AWS, Azure, GCP</li>
+                    <li>CI/CD (GitHub Actions, Jenkins)</li>
+                    <li>IaC (Terraform, CloudFormation)</li>
+                    <li>Docker, Kubernetes</li>
+                </ul>
+            </div>
+
+            <div class="skill-category">
+                <h3>Databases</h3>
+                <ul>
+                    <li>SQL (PostgreSQL, MySQL, Oracle)</li>
+                    <li>NoSQL (MongoDB, Cassandra)</li>
+                    <li>RDBMS Systems</li>
+                </ul>
+            </div>
+
+            <div class="skill-category">
+                <h3>BI &amp; Visualization</h3>
+                <ul>
+                    <li>Power BI</li>
+                    <li>Advanced Excel</li>
+                    <li>Data Modeling</li>
+                    <li>Dashboard Development</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <section class="contact-section" id="contact">
+        <h2 class="section-title">Let's Connect</h2>
+        <p style="font-size: 18px; color: #b3b3b3; max-width: 600px; margin: 0 auto;">
+            I'm currently seeking opportunities in Data Engineering, Data Science, and Analytics. 
+            Let's discuss how I can contribute to your team!
+        </p>
+        <div class="contact-links">
+            <a href="mailto:nachiketdabhade5@gmail.com" class="contact-link">
+                📧 Email
+            </a>
+            <a href="https://linkedin.com/in/nachiketsdabhade" target="_blank" class="contact-link">
+                💼 LinkedIn
+            </a>
+            <a href="https://github.com/prodigy0512" target="_blank" class="contact-link">
+                🐱 GitHub
+            </a>
+            <a href="tel:+17169301677" class="contact-link">
+                📱 +1 716 930 1677
+            </a>
+        </div>
+    </section>
+
+    <footer>
+        <p>© 2025 Nachiket Dabhade. All rights reserved.</p>
+        <p style="margin-top: 10px; font-size: 12px;">MS in Engineering Science &amp; Data Science | University at Buffalo</p>
+    </footer>
+
+    <script>
+        const navbar = document.getElementById('navbar');
+        
+        window.addEventListener('scroll', () => {
+            if (window.scrollY > 50) {
+                navbar.classList.add('scrolled');
+            } else {
+                navbar.classList.remove('scrolled');
+            }
+        });
+
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+
+        // Resume download functionality
+        document.getElementById('downloadResume').addEventListener('click', function(e) {
+            e.preventDefault();
+            
+            // Create resume content
+            const resumeContent = `NACHIKET DABHADE
+Data Engineer | Data Scientist | Cloud & BI Specialist
+
+CONTACT
+Phone: +1 716 930 1677
+Email: nachiketdabhade5@gmail.com
+LinkedIn: linkedin.com/in/nachiketsdabhade
+GitHub: github.com/prodigy0512
+
+SUMMARY
+Data Engineer with 1.5+ years of experience in ETL pipelines, Azure cloud computing, machine learning, and web scraping. 
+Proficient in SQL, Data Modeling, ETL and Snowflake. Passionate about building scalable data solutions that drive business impact.
+
+EDUCATION
+University at Buffalo – SUNY, NY, USA
+MS in Engineering Science and Data Science | Jan 2024 - May 2025
+
+University of Mumbai, Mumbai, India
+BS in Computer Engineering | Jul 2017 - Jul 2021
+
+EXPERIENCE
+Tata Consultancy Services, Mumbai, India
+Technical Representative, Data Engineer | Sep 2021 – Jul 2023
+• Spearheaded global reporting and data optimization initiatives across EMEA, AMER, and APJ
+• Designed cost-optimized ETL pipeline using Azure Data Factory achieving 15% cost reduction
+• Developed interactive dashboards using Power BI and SQL for data modeling and visualization
+• Led A/B testing and KPI analysis to refine business intelligence strategies
+• Developed critical parts supply chain solution for Goodyear Tires during pandemic
+
+Shanti Industrial Services, Mumbai, India
+Technical Representative, Engineer | Sep 2020 – Dec 2023
+• Used project analytics and cost-performance data to optimize resource allocation
+• Increased production 5x through process optimization
+• Grew company turnover from ₹1 Cr to ₹6 Cr
+
+PROJECTS
+• Goodyear Tires Supply Chain – Real-time supply chain using Azure Data Factory, Event Hub, Stream Analytics
+• Supply Chain Risk Scoring Engine – ML analytics with Python, XGBoost, Kafka, and Hopsworks Feature Store
+• Web Scraping Solution – Python-based scraper processing 500,000+ data points daily
+• Heart Disease Prediction – Predictive model improving diagnostic accuracy by 25%
+
+SKILLS
+Programming: Python, SQL, R, MATLAB, Shell Scripting
+Data Science: Machine Learning, Deep Learning (TensorFlow, PyTorch), Feature Engineering
+Data Engineering: ETL Pipelines (Azure Data Factory, Airflow, AWS Glue), Big Data (Spark, Databricks, Hadoop)
+Cloud: AWS, Azure, GCP, Docker, Kubernetes, Terraform
+Databases: PostgreSQL, MySQL, Oracle, MongoDB, Cassandra, Snowflake, Redshift, BigQuery
+BI Tools: Power BI, Advanced Excel
+
+CERTIFICATIONS
+• Microsoft Certified: Azure Data Scientist Associate (DP-203) - Apr 2023
+• Microsoft Certified: Power BI Data Analyst Associate (DP-900) - Jun 2023
+• Microsoft Certified: Implementing Microsoft Azure Infrastructure Solutions - Aug 2024`;
+
+            // Create blob and download
+            const blob = new Blob([resumeContent], { type: 'text/plain' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Nachiket_Dabhade_Resume.txt';
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            
+            // Show notification
+            alert('Resume downloaded! Check your downloads folder.');
+        });
+
+        // Add download website button
+        window.addEventListener('load', function() {
+            const downloadBtn = document.createElement('button');
+            downloadBtn.innerHTML = '⬇️ Download Website Code';
+            downloadBtn.style.cssText = `
+                position: fixed;
+                bottom: 30px;
+                right: 30px;
+                padding: 15px 25px;
+                background: #e50914;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: bold;
+                cursor: pointer;
+                z-index: 10000;
+                box-shadow: 0 4px 12px rgba(229, 9, 20, 0.4);
+                transition: all 0.3s;
+            `;
+            
+            downloadBtn.onmouseover = function() {
+                this.style.transform = 'scale(1.05)';
+                this.style.boxShadow = '0 6px 16px rgba(229, 9, 20, 0.6)';
+            };
+            
+            downloadBtn.onmouseout = function() {
+                this.style.transform = 'scale(1)';
+                this.style.boxShadow = '0 4px 12px rgba(229, 9, 20, 0.4)';
+            };
+            
+            downloadBtn.onclick = function() {
+                const htmlContent = document.documentElement.outerHTML;
+                const blob = new Blob([htmlContent], { type: 'text/html' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'index.html';
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                
+                alert('✅ Website code downloaded as index.html!\n\nYou can now:\n1. Upload this to GitHub\n2. Deploy to any hosting service\n3. Edit it in any text editor');
+            };
+            
+            document.body.appendChild(downloadBtn);
+        });
+    </script>
+
+<button style="position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; background: rgb(229, 9, 20); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; z-index: 10000; box-shadow: rgba(229, 9, 20, 0.6) 0px 6px 16px; transition: 0.3s; transform: scale(1.05);">⬇️ Download Website Code</button></body></html>
