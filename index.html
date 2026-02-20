@@ -1,1273 +1,582 @@
-<html lang="en"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        let requestId = 0;
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = requestId++;
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream
-                resolve(new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers
-                }));
-              },
-              reject,
-              channelId
-            });
-            
-            window.parent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          if (event.data.type === 'takeScreenshot') {
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              window.parent.postMessage({
-                type: 'screenshotError',
-                error: new Error('Root element not found'),
-              }, '*');
-            }
-            const screenshot = await htmlToImage.toPng(rootElement, {
-              imagePlaceholder:
-                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-            });
-            window.parent.postMessage({
-              type: 'screenshotData',
-              data: screenshot,
-            }, '*');
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              window.parent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            window.parent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            window.parent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          window.parent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nachiket Dabhade - Data Engineer Portfolio</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Helvetica Neue', Arial, sans-serif;
-            background-color: #141414;
-            color: #fff;
-            overflow-x: hidden;
-        }
-
-        .navbar {
-            position: fixed;
-            top: 0;
-            width: 100%;
-            padding: 20px 50px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            z-index: 1000;
-            background: linear-gradient(180deg, rgba(0,0,0,0.7) 10%, transparent);
-            transition: background 0.3s;
-        }
-
-        .navbar.scrolled {
-            background: #141414;
-        }
-
-        .logo {
-            font-size: 32px;
-            font-weight: 900;
-            color: #e50914;
-            letter-spacing: -2px;
-            font-family: Impact, 'Arial Black', sans-serif;
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 30px;
-        }
-
-        .nav-links a {
-            color: #fff;
-            text-decoration: none;
-            font-size: 14px;
-            transition: color 0.3s;
-        }
-
-        .nav-links a:hover {
-            color: #e50914;
-        }
-
-        .hero {
-            position: relative;
-            height: 100vh;
-            background: linear-gradient(rgba(0,0,0,0.6), rgba(20,20,20,0.95)), 
-                        url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080"><defs><linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:%23e50914;stop-opacity:0.1"/><stop offset="100%" style="stop-color:%23831010;stop-opacity:0.05"/></linearGradient><pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse"><path d="M 60 0 L 0 0 0 60" fill="none" stroke="%23e50914" stroke-width="0.5" opacity="0.1"/></pattern></defs><rect width="1920" height="1080" fill="%23000"/><rect width="1920" height="1080" fill="url(%23grad1)"/><rect width="1920" height="1080" fill="url(%23grid)"/><g opacity="0.3"><circle cx="300" cy="200" r="150" fill="none" stroke="%23e50914" stroke-width="2"/><circle cx="300" cy="200" r="100" fill="none" stroke="%23e50914" stroke-width="1.5"/><circle cx="300" cy="200" r="50" fill="none" stroke="%23e50914" stroke-width="1"/></g><g opacity="0.2"><rect x="1400" y="700" width="200" height="200" fill="none" stroke="%23e50914" stroke-width="2" transform="rotate(45 1500 800)"/><rect x="1420" y="720" width="160" height="160" fill="none" stroke="%23e50914" stroke-width="1.5" transform="rotate(45 1500 800)"/></g><g opacity="0.25"><path d="M 800 100 L 900 300 L 1000 100 L 1100 300 L 1200 100" fill="none" stroke="%23e50914" stroke-width="2"/><path d="M 100 600 Q 300 500 500 600 T 900 600" fill="none" stroke="%23e50914" stroke-width="1.5" opacity="0.3"/></g><g fill="%23e50914"><circle cx="1600" cy="300" r="4" opacity="0.6"><animate attributeName="opacity" values="0.3;0.8;0.3" dur="3s" repeatCount="indefinite"/></circle><circle cx="500" cy="800" r="3" opacity="0.5"><animate attributeName="opacity" values="0.2;0.7;0.2" dur="4s" repeatCount="indefinite"/></circle><circle cx="1200" cy="600" r="5" opacity="0.4"><animate attributeName="opacity" values="0.3;0.9;0.3" dur="2.5s" repeatCount="indefinite"/></circle><circle cx="200" cy="400" r="3" opacity="0.5"><animate attributeName="opacity" values="0.2;0.6;0.2" dur="3.5s" repeatCount="indefinite"/></circle></g><g opacity="0.15"><polygon points="1700,900 1750,950 1800,900 1750,850" fill="%23e50914"/><polygon points="400,150 450,200 500,150 450,100" fill="%23e50914"/></g></svg>');
-            background-size: cover;
-            background-position: center;
-            display: flex;
-            align-items: center;
-            padding: 0 50px;
-            overflow: hidden;
-        }
-        
-        .hero::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: radial-gradient(circle at 20% 50%, rgba(229, 9, 20, 0.1) 0%, transparent 50%),
-                        radial-gradient(circle at 80% 80%, rgba(131, 16, 16, 0.1) 0%, transparent 50%);
-            animation: pulseGlow 8s ease-in-out infinite;
-        }
-        
-        @keyframes pulseGlow {
-            0%, 100% {
-                opacity: 0.5;
-            }
-            50% {
-                opacity: 0.8;
-            }
-        }
-
-        .hero-content {
-            max-width: 700px;
-            animation: fadeInUp 1s ease-out;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .loading-screen {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: #000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 9999;
-            animation: fadeOut 0.8s ease-out 3.5s forwards;
-        }
-
-        @keyframes fadeOut {
-            to {
-                opacity: 0;
-                visibility: hidden;
-            }
-        }
-
-        .loading-logo {
-            font-size: 120px;
-            font-weight: 900;
-            color: #e50914;
-            letter-spacing: -5px;
-            font-family: Impact, 'Arial Black', sans-serif;
-            position: relative;
-            overflow: hidden;
-            white-space: nowrap;
-        }
-
-        .loading-logo .letter {
-            display: inline-block;
-            opacity: 0;
-        }
-
-        .loading-logo .letter-n {
-            animation: showN 0.5s ease-out 0.3s forwards, scaleN 0.6s ease-in-out 1s forwards;
-            transform-origin: center;
-        }
-
-        .loading-logo .letter-a,
-        .loading-logo .letter-c,
-        .loading-logo .letter-h,
-        .loading-logo .letter-i,
-        .loading-logo .letter-k,
-        .loading-logo .letter-e,
-        .loading-logo .letter-t {
-            animation: expandLetters 0.8s ease-out 1.8s forwards;
-        }
-
-        @keyframes showN {
-            to {
-                opacity: 1;
-            }
-        }
-
-        @keyframes scaleN {
-            0% {
-                transform: scale(1);
-            }
-            50% {
-                transform: scale(1.3);
-            }
-            100% {
-                transform: scale(1);
-            }
-        }
-
-        @keyframes expandLetters {
-            0% {
-                opacity: 0;
-                transform: translateX(-20px);
-            }
-            100% {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        @keyframes pulse {
-            0%, 100% {
-                transform: scale(1);
-                opacity: 1;
-            }
-            50% {
-                transform: scale(1.1);
-                opacity: 0.8;
-            }
-        }
-
-        .hero h1 {
-            font-size: 64px;
-            font-weight: bold;
-            margin-bottom: 20px;
-            line-height: 1.1;
-        }
-
-        .hero .subtitle {
-            font-size: 24px;
-            margin-bottom: 30px;
-            color: #e5e5e5;
-        }
-
-        .hero .description {
-            font-size: 18px;
-            line-height: 1.6;
-            margin-bottom: 30px;
-            color: #ccc;
-        }
-
-        .cta-buttons {
-            display: flex;
-            gap: 15px;
-        }
-
-        .btn {
-            padding: 15px 30px;
-            font-size: 16px;
-            font-weight: bold;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.3s;
-            text-decoration: none;
-            display: inline-block;
-        }
-
-        .btn-primary {
-            background: #e50914;
-            color: #fff;
-        }
-
-        .btn-primary:hover {
-            background: #f40612;
-            transform: scale(1.05);
-        }
-
-        .btn-secondary {
-            background: rgba(109, 109, 110, 0.7);
-            color: #fff;
-        }
-
-        .btn-secondary:hover {
-            background: rgba(109, 109, 110, 0.9);
-        }
-
-        .section {
-            padding: 60px 50px;
-        }
-
-        .section-title {
-            font-size: 28px;
-            margin-bottom: 30px;
-            font-weight: bold;
-        }
-
-        .cards-container {
-            display: flex;
-            gap: 20px;
-            overflow-x: auto;
-            padding-bottom: 20px;
-            scrollbar-width: thin;
-            scrollbar-color: #e50914 #141414;
-        }
-
-        .cards-container::-webkit-scrollbar {
-            height: 8px;
-        }
-
-        .cards-container::-webkit-scrollbar-track {
-            background: #141414;
-        }
-
-        .cards-container::-webkit-scrollbar-thumb {
-            background: #e50914;
-            border-radius: 4px;
-        }
-
-        .card {
-            min-width: 300px;
-            background: #1f1f1f;
-            border-radius: 8px;
-            overflow: hidden;
-            transition: transform 0.3s, box-shadow 0.3s;
-            cursor: pointer;
-        }
-
-        .card:hover {
-            transform: scale(1.05);
-            box-shadow: 0 8px 16px rgba(229, 9, 20, 0.3);
-        }
-
-        .card-image {
-            width: 100%;
-            height: 180px;
-            background: linear-gradient(135deg, #e50914 0%, #831010 100%);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 48px;
-            font-weight: bold;
-            color: rgba(255,255,255,0.9);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .card-image::before {
-            content: '';
-            position: absolute;
-            width: 200%;
-            height: 200%;
-            background: repeating-linear-gradient(
-                45deg,
-                transparent,
-                transparent 10px,
-                rgba(255,255,255,0.03) 10px,
-                rgba(255,255,255,0.03) 20px
-            );
-            animation: slidePattern 20s linear infinite;
-        }
-
-        @keyframes slidePattern {
-            0% {
-                transform: translate(-50%, -50%);
-            }
-            100% {
-                transform: translate(0%, 0%);
-            }
-        }
-
-        .card-icon {
-            position: relative;
-            z-index: 1;
-            font-size: 64px;
-            filter: drop-shadow(0 4px 8px rgba(0,0,0,0.3));
-        }
-
-        .card-content {
-            padding: 20px;
-        }
-
-        .card-title {
-            font-size: 20px;
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-
-        .card-description {
-            font-size: 14px;
-            line-height: 1.5;
-            color: #b3b3b3;
-        }
-
-        .card-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 15px;
-        }
-
-        .tag {
-            background: rgba(229, 9, 20, 0.2);
-            color: #e50914;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-        }
-
-        .experience-card {
-            background: #1f1f1f;
-            border-radius: 8px;
-            padding: 30px;
-            margin-bottom: 20px;
-            border-left: 4px solid #e50914;
-        }
-
-        .experience-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: start;
-            margin-bottom: 15px;
-        }
-
-        .experience-title {
-            font-size: 22px;
-            font-weight: bold;
-        }
-
-        .experience-company {
-            color: #e50914;
-            font-size: 18px;
-            margin-bottom: 5px;
-        }
-
-        .experience-date {
-            color: #b3b3b3;
-            font-size: 14px;
-        }
-
-        .experience-description {
-            list-style: none;
-            padding: 0;
-        }
-
-        .experience-description li {
-            padding-left: 20px;
-            margin-bottom: 10px;
-            position: relative;
-            color: #ccc;
-            line-height: 1.6;
-        }
-
-        .experience-description li:before {
-            content: "▹";
-            position: absolute;
-            left: 0;
-            color: #e50914;
-            font-weight: bold;
-        }
-
-        .skills-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-        }
-
-        .skill-category {
-            background: #1f1f1f;
-            padding: 25px;
-            border-radius: 8px;
-            transition: transform 0.3s;
-        }
-
-        .skill-category:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 16px rgba(229, 9, 20, 0.2);
-        }
-
-        .skill-category h3 {
-            color: #e50914;
-            margin-bottom: 15px;
-            font-size: 18px;
-        }
-
-        .skill-category ul {
-            list-style: none;
-            color: #ccc;
-        }
-
-        .skill-category li {
-            padding: 5px 0;
-            font-size: 14px;
-        }
-
-        .contact-section {
-            text-align: center;
-            padding: 80px 50px;
-            background: linear-gradient(180deg, #141414 0%, #0a0a0a 100%);
-        }
-
-        .contact-links {
-            display: flex;
-            justify-content: center;
-            gap: 30px;
-            margin-top: 30px;
-            flex-wrap: wrap;
-        }
-
-        .contact-link {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: #fff;
-            text-decoration: none;
-            padding: 15px 25px;
-            background: rgba(229, 9, 20, 0.1);
-            border-radius: 8px;
-            transition: all 0.3s;
-        }
-
-        .contact-link:hover {
-            background: #e50914;
-            transform: translateY(-3px);
-        }
-
-        footer {
-            text-align: center;
-            padding: 30px;
-            background: #0a0a0a;
-            color: #666;
-        }
-
-        @media (max-width: 768px) {
-            .hero h1 {
-                font-size: 42px;
-            }
-
-            .hero .subtitle {
-                font-size: 18px;
-            }
-
-            .navbar {
-                padding: 15px 20px;
-            }
-
-            .section {
-                padding: 40px 20px;
-            }
-
-            .nav-links {
-                gap: 15px;
-            }
-
-            .nav-links a {
-                font-size: 12px;
-            }
-        }
-    </style>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Nachiket Dabhade | Data Engineer</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@300;400;500;600;700&family=Barlow+Condensed:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --red: #E50914;
+      --red-dark: #B20710;
+      --red-glow: rgba(229,9,20,0.35);
+      --black: #000000;
+      --dark: #141414;
+      --card: #1a1a1a;
+      --card-hover: #242424;
+      --text: #FFFFFF;
+      --muted: #b3b3b3;
+      --dimmed: #6d6d6d;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body { background: var(--black); color: var(--text); font-family: 'Barlow', sans-serif; overflow-x: hidden; cursor: default; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--dark); }
+    ::-webkit-scrollbar-thumb { background: var(--red); border-radius: 2px; }
+
+    /* ═══════════════════════════════════════════════════
+       NETFLIX N INTRO SPLASH
+    ═══════════════════════════════════════════════════ */
+    #splash {
+      position: fixed; inset: 0; z-index: 9999;
+      background: #000;
+      display: flex; align-items: center; justify-content: center;
+      animation: splashExit 0.75s 3.3s cubic-bezier(0.55,0,1,0.45) forwards;
+    }
+    /* Outer wrapper for relative positioning of glow/shadow */
+    .n-scene { position: relative; }
+
+    /* Ambient red glow behind the N */
+    .n-glow {
+      position: absolute;
+      left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      width: 280px; height: 360px;
+      background: radial-gradient(ellipse at center, rgba(229,9,20,0.7) 0%, transparent 65%);
+      filter: blur(18px);
+      opacity: 0;
+      pointer-events: none;
+      z-index: 0;
+      animation: glowBurst 2s 0.3s ease-out forwards;
+    }
+
+    /* The N shape container */
+    .n-stage {
+      position: relative; z-index: 1;
+      width: 112px; height: 194px;
+    }
+
+    /* 3D tilt that settles to flat — mimics Netflix's perspective reveal */
+    .n-3d {
+      position: absolute; inset: 0;
+      transform: perspective(480px) rotateY(-20deg) scale(0.82);
+      animation: n3dSettle 0.6s 0.05s cubic-bezier(0.22,1,0.36,1) forwards;
+    }
+
+    /* ── LEFT BAR ── */
+    .bar-l {
+      position: absolute;
+      left: 0; top: 0;
+      width: 25px; height: 194px;
+      background: linear-gradient(168deg, #c8202a 0%, #E50914 40%, #850008 100%);
+      /* shadow on right edge for depth */
+      box-shadow: inset -5px 0 14px rgba(0,0,0,0.45), 8px 0 28px rgba(229,9,20,0.3);
+      /* clip from top, reveal downward */
+      clip-path: inset(100% 0 0 0);
+      animation: barDown 0.4s 0.07s cubic-bezier(0.22,1,0.36,1) forwards;
+    }
+
+    /* ── DIAGONAL SLASH ── */
+    .bar-d {
+      position: absolute;
+      left: 21px; top: 0;
+      width: 70px; height: 194px;
+      overflow: hidden;
+      clip-path: inset(100% 0 0 0);
+      animation: barDown 0.44s 0.13s cubic-bezier(0.22,1,0.36,1) forwards;
+    }
+    .bar-d-fill {
+      position: absolute; inset: 0;
+      background: linear-gradient(168deg, #c8202a 0%, #E50914 40%, #850008 100%);
+      /* the actual N diagonal shape */
+      clip-path: polygon(0 0, 26px 0, 100% 100%, calc(100% - 26px) 100%);
+      box-shadow: inset 0 0 18px rgba(0,0,0,0.35);
+    }
+
+    /* ── RIGHT BAR ── */
+    .bar-r {
+      position: absolute;
+      right: 0; top: 0;
+      width: 25px; height: 194px;
+      background: linear-gradient(168deg, #c8202a 0%, #E50914 40%, #850008 100%);
+      box-shadow: inset 5px 0 14px rgba(0,0,0,0.45), -8px 0 28px rgba(229,9,20,0.3);
+      clip-path: inset(100% 0 0 0);
+      animation: barDown 0.4s 0.2s cubic-bezier(0.22,1,0.36,1) forwards;
+    }
+
+    /* ── SPECULAR HIGHLIGHT / FLARE ── */
+    .n-flare {
+      position: absolute; inset: -12px;
+      background: linear-gradient(
+        110deg,
+        transparent 26%,
+        rgba(255,255,255,0)   34%,
+        rgba(255,255,255,0.6) 46%,
+        rgba(255,255,255,0)   58%,
+        transparent 66%
+      );
+      opacity: 0;
+      pointer-events: none;
+      animation: flareSweep 0.55s 0.65s cubic-bezier(0.4,0,0.2,1) forwards;
+    }
+
+    /* ── GROUND SHADOW ── */
+    .n-shadow {
+      position: absolute;
+      bottom: -26px; left: 50%;
+      transform: translateX(-50%) scaleY(0.45);
+      width: 88px; height: 28px;
+      background: radial-gradient(ellipse, rgba(229,9,20,0.5) 0%, transparent 70%);
+      filter: blur(7px);
+      opacity: 0;
+      z-index: 0;
+      animation: shadowIn 0.4s 0.42s ease forwards;
+    }
+
+    /* ── NAME BELOW THE N ── */
+    .splash-name {
+      position: absolute;
+      bottom: -52px; left: 50%;
+      transform: translateX(-50%);
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: 15px; letter-spacing: 11px;
+      color: transparent; white-space: nowrap;
+      animation: nameIn 0.7s 1.05s ease forwards;
+    }
+
+    /* ── KEYFRAMES ── */
+    @keyframes barDown {
+      from { clip-path: inset(100% 0 0 0); }
+      to   { clip-path: inset(0%   0 0 0); }
+    }
+    @keyframes n3dSettle {
+      to { transform: perspective(480px) rotateY(0deg) scale(1); }
+    }
+    @keyframes flareSweep {
+      0%   { opacity: 0; transform: translateX(-110px); }
+      35%  { opacity: 1; }
+      100% { opacity: 0; transform: translateX(110px); }
+    }
+    @keyframes glowBurst {
+      0%   { opacity: 0; transform: translate(-50%,-50%) scale(0.55); }
+      22%  { opacity: 1; transform: translate(-50%,-50%) scale(1.12); }
+      60%  { opacity: 0.6; transform: translate(-50%,-50%) scale(1); }
+      100% { opacity: 0; transform: translate(-50%,-50%) scale(1.35); }
+    }
+    @keyframes shadowIn { to { opacity: 1; } }
+    @keyframes nameIn   { to { color: rgba(255,255,255,0.42); } }
+    @keyframes splashExit {
+      0%   { opacity: 1; transform: scale(1); }
+      45%  { opacity: 1; transform: scale(1.07); }
+      100% { opacity: 0; transform: scale(1.07); }
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+      padding: 18px 48px;
+      display: flex; align-items: center; justify-content: space-between;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.95) 0%, transparent 100%);
+      transition: background 0.3s;
+    }
+    nav.scrolled { background: rgba(0,0,0,0.97); }
+    .logo { font-family: 'Bebas Neue', sans-serif; font-size: 42px; color: var(--red); letter-spacing: 2px; text-shadow: 0 0 30px var(--red-glow); user-select: none; }
+    .logo span { color: var(--text); }
+    nav ul { list-style: none; display: flex; gap: 32px; }
+    nav ul a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase; transition: color 0.2s; }
+    nav ul a:hover { color: var(--text); }
+
+    /* ── HERO ── */
+    #hero { position: relative; min-height: 100vh; display: flex; align-items: center; overflow: hidden; }
+    .hero-bg {
+      position: absolute; inset: 0;
+      background: radial-gradient(ellipse 80% 60% at 60% 40%, rgba(229,9,20,0.08) 0%, transparent 70%),
+                  radial-gradient(ellipse 60% 80% at 80% 80%, rgba(229,9,20,0.05) 0%, transparent 60%),
+                  linear-gradient(135deg, #000 0%, #0a0a0a 50%, #0d0000 100%);
+      z-index: 0;
+    }
+    .hero-bg::after {
+      content: ''; position: absolute; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,0.012) 2px, rgba(255,255,255,0.012) 4px);
+      pointer-events: none;
+    }
+    .grid-overlay {
+      position: absolute; inset: 0;
+      background-image: linear-gradient(rgba(229,9,20,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(229,9,20,0.04) 1px, transparent 1px);
+      background-size: 80px 80px; z-index: 0;
+      mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, black 30%, transparent 80%);
+    }
+    .hero-content { position: relative; z-index: 2; padding: 0 80px; max-width: 900px; }
+    .hero-tag { display: inline-block; font-family: 'Barlow Condensed', sans-serif; font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; color: var(--red); border: 1px solid var(--red); padding: 6px 16px; margin-bottom: 28px; opacity: 0; animation: fadeUp 0.8s 4.2s forwards; }
+    .hero-title { font-family: 'Bebas Neue', sans-serif; font-size: clamp(64px, 10vw, 130px); line-height: 0.92; letter-spacing: 2px; margin-bottom: 10px; opacity: 0; animation: fadeUp 0.9s 4.4s forwards; }
+    .hero-title .line2 { color: var(--red); display: block; text-shadow: 0 0 60px var(--red-glow), 0 0 120px var(--red-glow); }
+    .hero-subtitle { font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 400; letter-spacing: 4px; text-transform: uppercase; color: var(--muted); margin: 20px 0 14px; opacity: 0; animation: fadeUp 0.9s 4.6s forwards; }
+    .hero-desc { font-size: 16px; line-height: 1.7; color: var(--muted); max-width: 560px; margin-bottom: 44px; opacity: 0; animation: fadeUp 0.9s 4.8s forwards; }
+    .hero-btns { display: flex; gap: 16px; flex-wrap: wrap; opacity: 0; animation: fadeUp 0.9s 5s forwards; }
+    .btn-primary { display: inline-flex; align-items: center; gap: 10px; background: var(--red); color: #fff; padding: 14px 32px; font-family: 'Barlow Condensed', sans-serif; font-size: 16px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; text-decoration: none; border: none; cursor: pointer; transition: background 0.2s, transform 0.15s, box-shadow 0.2s; }
+    .btn-primary:hover { background: var(--red-dark); transform: scale(1.03); box-shadow: 0 0 30px var(--red-glow); }
+    .btn-secondary { display: inline-flex; align-items: center; gap: 10px; background: rgba(109,109,109,0.4); color: #fff; padding: 14px 32px; font-family: 'Barlow Condensed', sans-serif; font-size: 16px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; text-decoration: none; border: none; cursor: pointer; transition: background 0.2s, transform 0.15s; }
+    .btn-secondary:hover { background: rgba(109,109,109,0.6); transform: scale(1.03); }
+    .hero-stats { position: absolute; right: 80px; bottom: 80px; display: flex; flex-direction: column; gap: 20px; z-index: 2; opacity: 0; animation: fadeLeft 0.9s 5.2s forwards; }
+    .stat { text-align: right; border-right: 3px solid var(--red); padding-right: 20px; }
+    .stat-num { font-family: 'Bebas Neue', sans-serif; font-size: 42px; color: var(--text); line-height: 1; }
+    .stat-label { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--dimmed); }
+    .scroll-hint { position: absolute; bottom: 40px; left: 80px; display: flex; align-items: center; gap: 12px; z-index: 2; opacity: 0; animation: fadeUp 0.9s 5.4s forwards; }
+    .scroll-line { width: 40px; height: 1px; background: var(--red); animation: scrollPulse 2s infinite; }
+    .scroll-text { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--dimmed); }
+
+    /* ── SECTIONS ── */
+    section { padding: 80px 0; }
+    .section-label { padding: 0 48px; margin-bottom: 24px; display: flex; align-items: center; gap: 16px; }
+    .section-label h2 { font-family: 'Barlow Condensed', sans-serif; font-size: 24px; font-weight: 700; letter-spacing: 1px; white-space: nowrap; }
+    .section-label .label-line { flex: 1; height: 1px; background: linear-gradient(to right, rgba(229,9,20,0.5), transparent); }
+    .section-label .label-tag { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--red); }
+
+    /* ── ABOUT ── */
+    #about { background: linear-gradient(to right, var(--dark) 0%, #0d0000 100%); padding: 80px 80px; display: grid; grid-template-columns: 1fr 1fr; gap: 80px; align-items: center; }
+    .about-card { background: var(--card); border: 1px solid rgba(229,9,20,0.2); padding: 48px; position: relative; overflow: hidden; }
+    .about-card::before { content: 'N'; font-family: 'Bebas Neue', sans-serif; font-size: 320px; color: rgba(229,9,20,0.05); position: absolute; right: -40px; top: -60px; line-height: 1; pointer-events: none; }
+    .about-name { font-family: 'Bebas Neue', sans-serif; font-size: 52px; letter-spacing: 2px; margin-bottom: 6px; }
+    .about-role { font-family: 'Barlow Condensed', sans-serif; font-size: 16px; letter-spacing: 3px; text-transform: uppercase; color: var(--red); margin-bottom: 24px; }
+    .about-bio { font-size: 15px; line-height: 1.8; color: var(--muted); margin-bottom: 32px; }
+    .contact-row { display: flex; flex-direction: column; gap: 12px; }
+    .contact-item { display: flex; align-items: center; gap: 14px; font-size: 14px; color: var(--muted); }
+    .contact-item .icon { width: 32px; height: 32px; background: rgba(229,9,20,0.15); border: 1px solid rgba(229,9,20,0.3); display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+    .contact-item a { color: var(--muted); text-decoration: none; transition: color 0.2s; }
+    .contact-item a:hover { color: var(--red); }
+    .about-text h3 { font-family: 'Bebas Neue', sans-serif; font-size: 40px; letter-spacing: 2px; margin-bottom: 20px; }
+    .about-text p { font-size: 15px; line-height: 1.8; color: var(--muted); margin-bottom: 16px; }
+    .cert-list { margin-top: 28px; display: flex; flex-direction: column; gap: 10px; }
+    .cert-item { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--muted); }
+    .cert-badge { background: rgba(229,9,20,0.12); border: 1px solid rgba(229,9,20,0.3); color: var(--red); font-family: 'Barlow Condensed', sans-serif; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; padding: 3px 8px; white-space: nowrap; }
+
+    /* ── EXPERIENCE ── */
+    .row-container { padding: 0 48px; }
+    .exp-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 4px; }
+    .exp-card { background: var(--card); border-top: 3px solid transparent; padding: 36px; transition: border-color 0.3s, background 0.3s, transform 0.3s; position: relative; overflow: hidden; }
+    .exp-card::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(to right, var(--red), transparent); transform: scaleX(0); transform-origin: left; transition: transform 0.3s; }
+    .exp-card:hover { background: var(--card-hover); border-top-color: var(--red); transform: translateY(-4px); }
+    .exp-card:hover::after { transform: scaleX(1); }
+    .exp-period { font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: var(--red); margin-bottom: 12px; }
+    .exp-title { font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 700; letter-spacing: 1px; margin-bottom: 4px; }
+    .exp-company { font-size: 13px; color: var(--dimmed); margin-bottom: 20px; letter-spacing: 1px; }
+    .exp-bullets { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+    .exp-bullets li { font-size: 13px; line-height: 1.6; color: var(--muted); padding-left: 16px; position: relative; }
+    .exp-bullets li::before { content: '▸'; color: var(--red); position: absolute; left: 0; top: 0; }
+
+    /* ── SKILLS ── */
+    #skills { background: var(--dark); padding: 80px 0; }
+    .skills-grid { padding: 0 48px; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 4px; }
+    .skill-group { background: var(--card); padding: 32px; transition: background 0.2s; }
+    .skill-group:hover { background: var(--card-hover); }
+    .skill-group-title { font-family: 'Barlow Condensed', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: var(--red); margin-bottom: 20px; display: flex; align-items: center; gap: 8px; }
+    .skill-group-title::after { content: ''; flex: 1; height: 1px; background: rgba(229,9,20,0.3); }
+    .skill-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+    .skill-tag { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); color: var(--muted); font-size: 12px; padding: 5px 12px; transition: all 0.2s; cursor: default; }
+    .skill-tag:hover { background: rgba(229,9,20,0.15); border-color: rgba(229,9,20,0.4); color: var(--text); }
+
+    /* ── PROJECTS ── */
+    #projects { background: var(--black); padding: 80px 0; }
+    .projects-grid { padding: 0 48px; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 4px; }
+    .project-card { background: var(--card); position: relative; overflow: hidden; cursor: pointer; transition: transform 0.35s, box-shadow 0.35s; aspect-ratio: 16/9; display: flex; flex-direction: column; justify-content: flex-end; }
+    .project-card:hover { transform: scale(1.04); z-index: 10; box-shadow: 0 20px 60px rgba(0,0,0,0.8), 0 0 0 2px var(--red); }
+    .project-bg { position: absolute; inset: 0; z-index: 0; }
+    .project-card:nth-child(1) .project-bg { background: linear-gradient(135deg, #1a0000 0%, #3d0000 50%, #1a0000 100%); }
+    .project-card:nth-child(2) .project-bg { background: linear-gradient(135deg, #000a1a 0%, #001a3d 50%, #000a1a 100%); }
+    .project-card:nth-child(3) .project-bg { background: linear-gradient(135deg, #0d1a00 0%, #1a3300 50%, #0d1a00 100%); }
+    .project-card:nth-child(4) .project-bg { background: linear-gradient(135deg, #1a0e00 0%, #3d2200 50%, #1a0e00 100%); }
+    .project-icon { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-70%); font-size: 56px; opacity: 0.15; transition: opacity 0.3s, transform 0.3s; z-index: 1; }
+    .project-card:hover .project-icon { opacity: 0.06; transform: translate(-50%,-50%) scale(1.4); }
+    .project-content { position: relative; z-index: 2; padding: 20px 24px; background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.7) 60%, transparent 100%); transform: translateY(40px); transition: transform 0.35s; }
+    .project-card:hover .project-content { transform: translateY(0); }
+    .project-title { font-family: 'Barlow Condensed', sans-serif; font-size: 18px; font-weight: 700; letter-spacing: 1px; margin-bottom: 6px; }
+    .project-desc { font-size: 12px; line-height: 1.5; color: var(--muted); opacity: 0; max-height: 0; overflow: hidden; transition: opacity 0.3s 0.1s, max-height 0.3s; }
+    .project-card:hover .project-desc { opacity: 1; max-height: 80px; }
+    .project-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .project-tag { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--red); border: 1px solid rgba(229,9,20,0.4); padding: 2px 8px; }
+
+    /* ── EDUCATION ── */
+    #education { background: var(--dark); padding: 80px 0; }
+    .edu-row { padding: 0 48px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+    .edu-card { background: var(--card); padding: 40px; border-bottom: 3px solid transparent; transition: border-color 0.3s, background 0.3s; position: relative; overflow: hidden; }
+    .edu-card:hover { background: var(--card-hover); border-bottom-color: var(--red); }
+    .edu-degree { font-family: 'Barlow Condensed', sans-serif; font-size: 20px; font-weight: 700; letter-spacing: 1px; margin-bottom: 8px; }
+    .edu-school { font-size: 14px; font-weight: 600; color: var(--red); letter-spacing: 1px; margin-bottom: 6px; }
+    .edu-location { font-size: 13px; color: var(--dimmed); }
+    .edu-num { font-family: 'Bebas Neue', sans-serif; font-size: 80px; color: rgba(229,9,20,0.06); position: absolute; right: 20px; bottom: 0; line-height: 1; pointer-events: none; }
+
+    /* ── FOOTER ── */
+    footer { background: var(--black); border-top: 1px solid rgba(229,9,20,0.15); padding: 60px 80px; display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: center; }
+    footer .footer-logo { font-family: 'Bebas Neue', sans-serif; font-size: 48px; color: var(--red); letter-spacing: 2px; margin-bottom: 8px; }
+    footer .footer-sub { font-size: 13px; color: var(--dimmed); letter-spacing: 2px; text-transform: uppercase; }
+    footer .footer-links { display: flex; flex-direction: column; align-items: flex-end; gap: 14px; }
+    footer .footer-links a { color: var(--muted); text-decoration: none; font-size: 14px; letter-spacing: 1px; display: flex; align-items: center; gap: 8px; transition: color 0.2s; }
+    footer .footer-links a:hover { color: var(--red); }
+    footer .footer-copy { grid-column: 1/-1; font-size: 12px; color: var(--dimmed); text-align: center; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); }
+
+    /* ── SHARED ANIMATIONS ── */
+    @keyframes fadeUp   { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes fadeLeft { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes scrollPulse { 0%,100% { width: 40px; opacity: 1; } 50% { width: 60px; opacity: 0.5; } }
+    .reveal { opacity: 0; transform: translateY(24px); transition: opacity 0.7s ease, transform 0.7s ease; }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+    .reveal-delay-1 { transition-delay: 0.1s; }
+    .reveal-delay-2 { transition-delay: 0.2s; }
+    .reveal-delay-3 { transition-delay: 0.3s; }
+
+    @media (max-width: 900px) {
+      nav { padding: 16px 24px; }
+      nav ul { display: none; }
+      .hero-content { padding: 0 32px; }
+      #about { grid-template-columns: 1fr; padding: 60px 32px; }
+      .edu-row { grid-template-columns: 1fr; }
+      footer { grid-template-columns: 1fr; }
+      footer .footer-links { align-items: flex-start; }
+      .hero-stats { display: none; }
+      .scroll-hint { left: 32px; }
+    }
+  </style>
 </head>
-<body id="artifacts-component-root-html">
-    <div class="loading-screen">
-        <div class="loading-logo">
-            <span class="letter letter-n">N</span><span class="letter letter-a">ACHIKET</span>
-        </div>
+<body>
+
+<!-- ══════════════ NETFLIX N INTRO ══════════════ -->
+<div id="splash">
+  <div class="n-scene">
+    <!-- ambient glow -->
+    <div class="n-glow"></div>
+    <!-- the N -->
+    <div class="n-stage">
+      <div class="n-3d">
+        <div class="bar-l"></div>
+        <div class="bar-d"><div class="bar-d-fill"></div></div>
+        <div class="bar-r"></div>
+        <div class="n-flare"></div>
+      </div>
     </div>
+    <!-- ground shadow -->
+    <div class="n-shadow"></div>
+    <!-- NACHIKET subtitle -->
+    <div class="splash-name">NACHIKET</div>
+  </div>
+</div>
 
-    <nav class="navbar" id="navbar">
-        <div class="logo">ND</div>
-        <div class="nav-links">
-            <a href="#about">About</a>
-            <a href="#experience">Experience</a>
-            <a href="#projects">Projects</a>
-            <a href="#skills">Skills</a>
-            <a href="#contact">Contact</a>
-        </div>
-    </nav>
+<!-- NAV -->
+<nav id="navbar">
+  <div class="logo">N<span>achiket</span></div>
+  <ul>
+    <li><a href="#about">About</a></li>
+    <li><a href="#experience">Experience</a></li>
+    <li><a href="#skills">Skills</a></li>
+    <li><a href="#projects">Projects</a></li>
+    <li><a href="#education">Education</a></li>
+  </ul>
+</nav>
 
-    <section class="hero">
-        <div class="hero-content">
-            <h1>Nachiket Dabhade</h1>
-            <div class="subtitle">Data Engineer | Data Scientist | Cloud &amp; BI Specialist</div>
-            <p class="description">
-                Transforming raw data into actionable insights with 1.5+ years of experience in ETL pipelines, 
-                Azure cloud computing, and machine learning. Passionate about building scalable data solutions 
-                that drive business impact.
-            </p>
-            <div class="cta-buttons">
-                <a href="#contact" class="btn btn-primary">Get In Touch</a>
-                <a href="#" class="btn btn-secondary" id="downloadResume">Download Resume</a>
-            </div>
-        </div>
-    </section>
+<!-- HERO -->
+<section id="hero">
+  <div class="hero-bg"></div>
+  <div class="grid-overlay"></div>
+  <div class="hero-content">
+    <div class="hero-tag">Data Engineer · Cloud Architect</div>
+    <h1 class="hero-title">NACHIKET<br/><span class="line2">DABHADE</span></h1>
+    <p class="hero-subtitle">Designing scalable data pipelines &amp; cloud-native platforms</p>
+    <p class="hero-desc">Data Engineer with expertise in Azure, Snowflake, and big data ecosystems. I build high-performance ETL systems and analytics architectures that power data-driven decisions at global scale.</p>
+    <div class="hero-btns">
+      <a href="#experience" class="btn-primary">▶ &nbsp; View My Work</a>
+      <a href="mailto:nachiketdabhade22@gmail.com" class="btn-secondary">✉ &nbsp; Contact Me</a>
+    </div>
+  </div>
+  <div class="hero-stats">
+    <div class="stat"><div class="stat-num">3+</div><div class="stat-label">Years Experience</div></div>
+    <div class="stat"><div class="stat-num">15%</div><div class="stat-label">Cost Reduction Achieved</div></div>
+    <div class="stat"><div class="stat-num">85%</div><div class="stat-label">Re-ID Model Accuracy</div></div>
+  </div>
+  <div class="scroll-hint"><div class="scroll-line"></div><span class="scroll-text">Scroll to explore</span></div>
+</section>
 
-    <section class="section" id="about">
-        <h2 class="section-title">About Me</h2>
-        <div class="experience-card">
-            <p style="line-height: 1.8; color: #e5e5e5; font-size: 16px;">
-                I'm a Data Engineer and Data Scientist currently pursuing my MS in Engineering Science and Data Science 
-                at the University at Buffalo, SUNY. With a strong foundation in ETL pipelines, cloud computing (Azure, AWS, GCP), 
-                and machine learning, I specialize in designing cost-optimized data solutions that streamline operations and 
-                drive strategic decision-making.
-                <br><br>
-                During my time at Tata Consultancy Services, I spearheaded global reporting initiatives, built scalable ETL 
-                pipelines that reduced operational costs by 15%, and developed real-time supply chain solutions for major clients 
-                like Goodyear Tires. I'm proficient in SQL, Python, Power BI, and various Azure services, with hands-on experience 
-                in data warehousing using Snowflake, Redshift, and BigQuery.
-            </p>
-        </div>
-    </section>
+<!-- ABOUT -->
+<section id="about">
+  <div class="about-visual reveal">
+    <div class="about-card">
+      <div class="about-name">Nachiket Dabhade</div>
+      <div class="about-role">Data Engineer · Azure Specialist</div>
+      <p class="about-bio">Based in Buffalo, New York. Open to relocation. Currently at LVT Labs, building end-to-end health data pipelines and scalable cloud architectures that bridge engineering and analytics.</p>
+      <div class="contact-row">
+        <div class="contact-item"><div class="icon">📍</div><span>Buffalo, New York — Open to Relocation</span></div>
+        <div class="contact-item"><div class="icon">📞</div><span>(716) 930-1677</span></div>
+        <div class="contact-item"><div class="icon">✉</div><a href="mailto:nachiketdabhade22@gmail.com">nachiketdabhade22@gmail.com</a></div>
+        <div class="contact-item"><div class="icon">in</div><a href="https://linkedin.com/in/nachiketsdabhade" target="_blank">linkedin.com/in/nachiketsdabhade</a></div>
+        <div class="contact-item"><div class="icon">gh</div><a href="https://github.com/prodigy0512" target="_blank">github.com/prodigy0512</a></div>
+      </div>
+    </div>
+  </div>
+  <div class="about-text reveal reveal-delay-2">
+    <h3>Crafting Pipelines<br/>That Scale</h3>
+    <p>With a Master's in Engineering Science &amp; Data Science from University at Buffalo, I combine rigorous academic foundations with hands-on industry experience in building cloud-native data systems across Azure, AWS, and GCP.</p>
+    <p>From streaming architectures with Kafka and Kinesis, to dimensional modeling in Snowflake and Synapse, I engineer data platforms that are reliable, cost-efficient, and analytics-ready.</p>
+    <div class="cert-list">
+      <div class="cert-item"><span class="cert-badge">Microsoft</span>Azure Infrastructure Solutions</div>
+      <div class="cert-item"><span class="cert-badge">Microsoft</span>Power BI Data Analyst Associate (DP-900)</div>
+      <div class="cert-item"><span class="cert-badge">Microsoft</span>Azure Data Scientist Associate (DP-203)</div>
+    </div>
+  </div>
+</section>
 
-    <section class="section" id="experience">
-        <h2 class="section-title">Professional Experience</h2>
-        
-        <div class="experience-card">
-            <div class="experience-header">
-                <div>
-                    <div class="experience-company">Tata Consultancy Services</div>
-                    <div class="experience-title">Technical Representative, Data Engineer</div>
-                </div>
-                <div class="experience-date">Sep 2021 – Jul 2023</div>
-            </div>
-            <ul class="experience-description">
-                <li>Spearheaded global reporting and data optimization initiatives across EMEA, AMER, and APJ, streamlining data assets and management workflows</li>
-                <li>Designed and implemented cost-optimized ETL pipeline leveraging Azure Data Factory, Blob Storage, and Azure Synapse Analytics, achieving 15% reduction in operational costs</li>
-                <li>Developed interactive dashboards using Power BI and SQL for data modeling and visualization, performing detailed region and product-specific analysis</li>
-                <li>Led A/B testing and KPI analysis to refine business intelligence strategies and optimize operational performance</li>
-                <li>Developed critical parts supply chain solution for Goodyear Tires during the pandemic, ensuring operational continuity</li>
-            </ul>
-        </div>
+<!-- EXPERIENCE -->
+<section id="experience" style="background: var(--black); padding-top: 80px;">
+  <div class="section-label reveal">
+    <span class="label-tag">Career</span>
+    <h2>Experience</h2>
+    <div class="label-line"></div>
+  </div>
+  <div class="row-container">
+    <div class="exp-cards">
+      <div class="exp-card reveal">
+        <div class="exp-period">Aug 2025 – Present</div>
+        <div class="exp-title">Data Engineer</div>
+        <div class="exp-company">LVT Labs · Buffalo, NY</div>
+        <ul class="exp-bullets">
+          <li>Developed Health Chrono — an end-to-end pipeline for health datasets using advanced ETL workflows.</li>
+          <li>Designed RESTful APIs for data ingestion integrated with Azure Data Factory for scalable data flow.</li>
+          <li>Standardized ingestion and transformation processes to improve downstream analytics accessibility.</li>
+          <li>Optimized ETL workflows and storage formats to handle large-scale health datasets efficiently.</li>
+          <li>Collaborated with cross-functional teams to align pipelines with health data standards.</li>
+        </ul>
+      </div>
+      <div class="exp-card reveal reveal-delay-2">
+        <div class="exp-period">Sep 2021 – Jul 2023</div>
+        <div class="exp-title">Technical Representative, Data Engineer</div>
+        <div class="exp-company">Tata Consultancy Services · Mumbai, MH</div>
+        <ul class="exp-bullets">
+          <li>Spearheaded global reporting across EMEA, AMER, and APJ, streamlining enterprise data assets.</li>
+          <li>Designed a cost-optimized ETL pipeline on Azure (ADF + Blob + Synapse), achieving a <strong style="color:#fff">15% reduction</strong> in operational costs.</li>
+          <li>Built Power BI dashboards with SQL and Advanced Excel for product and region-specific analytics.</li>
+          <li>Led A/B testing and KPI analysis to refine BI strategies across multiple departments.</li>
+          <li>Executed QA for asset reports ensuring data accuracy, compliance, and governance best practices.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
 
-        <div class="experience-card">
-            <div class="experience-header">
-                <div>
-                    <div class="experience-company">Shanti Industrial Services</div>
-                    <div class="experience-title">Technical Representative, Engineer</div>
-                </div>
-                <div class="experience-date">Sep 2020 – Dec 2023</div>
-            </div>
-            <ul class="experience-description">
-                <li>Used project analytics and cost-performance data to optimize resource allocation and reduce material waste</li>
-                <li>Increased production 5x through process optimization; expanded to second plant and grew company turnover from ₹1 Cr to ₹6 Cr</li>
-                <li>Built and managed engineering teams, launched company website, and implemented systems to boost efficiency</li>
-            </ul>
-        </div>
-    </section>
+<!-- SKILLS -->
+<section id="skills">
+  <div class="section-label reveal"><span class="label-tag">Arsenal</span><h2>Skills &amp; Technologies</h2><div class="label-line"></div></div>
+  <div class="skills-grid">
+    <div class="skill-group reveal">
+      <div class="skill-group-title">Programming</div>
+      <div class="skill-tags"><span class="skill-tag">Python</span><span class="skill-tag">SQL</span><span class="skill-tag">PySpark</span><span class="skill-tag">R</span><span class="skill-tag">MATLAB</span><span class="skill-tag">Shell Scripting</span><span class="skill-tag">Pandas</span><span class="skill-tag">NumPy</span></div>
+    </div>
+    <div class="skill-group reveal reveal-delay-1">
+      <div class="skill-group-title">Data Engineering</div>
+      <div class="skill-tags"><span class="skill-tag">Azure Data Factory</span><span class="skill-tag">Apache Airflow</span><span class="skill-tag">AWS Glue</span><span class="skill-tag">dbt</span><span class="skill-tag">Apache Spark</span><span class="skill-tag">Databricks</span><span class="skill-tag">Hadoop</span><span class="skill-tag">Kafka</span><span class="skill-tag">Kinesis</span></div>
+    </div>
+    <div class="skill-group reveal reveal-delay-2">
+      <div class="skill-group-title">Data Warehousing</div>
+      <div class="skill-tags"><span class="skill-tag">Snowflake</span><span class="skill-tag">Azure Synapse</span><span class="skill-tag">Amazon Redshift</span><span class="skill-tag">BigQuery</span><span class="skill-tag">Kimball Modeling</span><span class="skill-tag">Data Lakes</span></div>
+    </div>
+    <div class="skill-group reveal">
+      <div class="skill-group-title">Cloud &amp; DevOps</div>
+      <div class="skill-tags"><span class="skill-tag">Azure</span><span class="skill-tag">AWS</span><span class="skill-tag">GCP</span><span class="skill-tag">Docker</span><span class="skill-tag">Kubernetes</span><span class="skill-tag">Terraform</span><span class="skill-tag">GitHub Actions</span><span class="skill-tag">Jenkins</span><span class="skill-tag">Azure DevOps</span></div>
+    </div>
+    <div class="skill-group reveal reveal-delay-1">
+      <div class="skill-group-title">Databases</div>
+      <div class="skill-tags"><span class="skill-tag">PostgreSQL</span><span class="skill-tag">MySQL</span><span class="skill-tag">SQL Server</span><span class="skill-tag">Oracle</span><span class="skill-tag">MongoDB</span><span class="skill-tag">Cassandra</span><span class="skill-tag">DynamoDB</span></div>
+    </div>
+    <div class="skill-group reveal reveal-delay-2">
+      <div class="skill-group-title">ML &amp; Analytics</div>
+      <div class="skill-tags"><span class="skill-tag">TensorFlow</span><span class="skill-tag">PyTorch</span><span class="skill-tag">XGBoost</span><span class="skill-tag">MLflow</span><span class="skill-tag">Power BI</span><span class="skill-tag">Streamlit</span><span class="skill-tag">FastAPI</span><span class="skill-tag">OpenCV</span></div>
+    </div>
+  </div>
+</section>
 
-    <section class="section" id="projects">
-        <h2 class="section-title">Featured Projects</h2>
-        <div class="cards-container">
-            <div class="card">
-                <div class="card-image">
-                    <div class="card-icon">
-                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <path d="M12 6v6l4 2"></path>
-                            <path d="M16 3.13a9 9 0 0 1 0 17.74"></path>
-                            <path d="M8 3.13a9 9 0 0 0 0 17.74"></path>
-                        </svg>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-title">Goodyear Tires Supply Chain</div>
-                    <div class="card-description">
-                        Architected a real-time tire components supply chain using Azure Data Factory, Event Hub, 
-                        Stream Analytics, and ADLS Gen2. Streamlined parts visibility across regions, cut manual 
-                        reporting by 40%, and enabled live dashboards.
-                    </div>
-                    <div class="card-tags">
-                        <span class="tag">Azure</span>
-                        <span class="tag">ETL</span>
-                        <span class="tag">Power BI</span>
-                    </div>
-                </div>
-            </div>
+<!-- PROJECTS -->
+<section id="projects">
+  <div class="section-label reveal"><span class="label-tag">Portfolio</span><h2>Featured Projects</h2><div class="label-line"></div></div>
+  <div class="projects-grid">
+    <div class="project-card reveal"><div class="project-bg"></div><div class="project-icon">🏭</div><div class="project-content"><div class="project-title">Goodyear Supply Chain</div><div class="project-desc">Real-time supply chain solution on Azure Data Lake, integrating on-premise and cloud Oracle data sources.</div><div class="project-tags"><span class="project-tag">Azure</span><span class="project-tag">Data Lake</span><span class="project-tag">Oracle</span></div></div></div>
+    <div class="project-card reveal reveal-delay-1"><div class="project-bg"></div><div class="project-icon">⚡</div><div class="project-content"><div class="project-title">Supply Chain Risk Engine</div><div class="project-desc">Real-time ML analytics with XGBoost, Kafka, and Hopsworks Feature Store, delivering live insights via Streamlit.</div><div class="project-tags"><span class="project-tag">Kafka</span><span class="project-tag">XGBoost</span><span class="project-tag">MLflow</span></div></div></div>
+    <div class="project-card reveal reveal-delay-2"><div class="project-bg"></div><div class="project-icon">🔬</div><div class="project-content"><div class="project-title">Heart Disease Prediction</div><div class="project-desc">HIPAA-compliant predictive model using Logistic Regression &amp; XGBoost improving diagnostic accuracy by 25%.</div><div class="project-tags"><span class="project-tag">XGBoost</span><span class="project-tag">MLflow</span><span class="project-tag">HIPAA</span></div></div></div>
+    <div class="project-card reveal reveal-delay-3"><div class="project-bg"></div><div class="project-icon">👁️</div><div class="project-content"><div class="project-title">Person Re-Identification</div><div class="project-desc">Deep facial feature-based surveillance system achieving 85% accuracy with CNN, MTCNN &amp; HOG models.</div><div class="project-tags"><span class="project-tag">CNN</span><span class="project-tag">TensorFlow</span><span class="project-tag">OpenCV</span></div></div></div>
+  </div>
+</section>
 
-            <div class="card">
-                <div class="card-image">
-                    <div class="card-icon">
-                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
-                            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
-                            <line x1="12" y1="22.08" x2="12" y2="12"></line>
-                        </svg>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-title">Supply Chain Risk Scoring Engine</div>
-                    <div class="card-description">
-                        Designed a real-time ML analytics system with Python, XGBoost, Kafka, and Hopsworks Feature Store, 
-                        delivering live insights via Streamlit and MLflow for predictive risk assessment.
-                    </div>
-                    <div class="card-tags">
-                        <span class="tag">Python</span>
-                        <span class="tag">XGBoost</span>
-                        <span class="tag">Kafka</span>
-                        <span class="tag">MLflow</span>
-                    </div>
-                </div>
-            </div>
+<!-- EDUCATION -->
+<section id="education">
+  <div class="section-label reveal"><span class="label-tag">Academic</span><h2>Education</h2><div class="label-line"></div></div>
+  <div class="edu-row row-container">
+    <div class="edu-card reveal"><div class="edu-degree">Master of Science in Engineering Science &amp; Data Science</div><div class="edu-school">University at Buffalo, SUNY</div><div class="edu-location">Buffalo, New York</div><div class="edu-num">MS</div></div>
+    <div class="edu-card reveal reveal-delay-2"><div class="edu-degree">Bachelor of Engineering in Computer Science</div><div class="edu-school">University of Mumbai</div><div class="edu-location">Mumbai, Maharashtra</div><div class="edu-num">BE</div></div>
+  </div>
+</section>
 
-            <div class="card">
-                <div class="card-image">
-                    <div class="card-icon">
-                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <circle cx="12" cy="12" r="3"></circle>
-                            <path d="M12 1v6m0 6v6"></path>
-                            <path d="M1 12h6m6 0h6"></path>
-                            <path d="m4.93 4.93 4.24 4.24m5.66 5.66 4.24 4.24"></path>
-                            <path d="m19.07 4.93-4.24 4.24m-5.66 5.66-4.24 4.24"></path>
-                        </svg>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-title">Web Scraping Solution</div>
-                    <div class="card-description">
-                        Implemented a Python-based web scraper leveraging NumPy and Pandas to process and clean 
-                        500,000+ data points daily, delivering actionable insights to multiple stakeholders.
-                    </div>
-                    <div class="card-tags">
-                        <span class="tag">Python</span>
-                        <span class="tag">Selenium</span>
-                        <span class="tag">Pandas</span>
-                    </div>
-                </div>
-            </div>
+<!-- FOOTER -->
+<footer>
+  <div>
+    <div class="footer-logo">N</div>
+    <div class="footer-sub">Nachiket Dabhade · Data Engineer</div>
+  </div>
+  <div class="footer-links">
+    <a href="mailto:nachiketdabhade22@gmail.com">✉ &nbsp; nachiketdabhade22@gmail.com</a>
+    <a href="https://linkedin.com/in/nachiketsdabhade" target="_blank">in &nbsp; linkedin.com/in/nachiketsdabhade</a>
+    <a href="https://github.com/prodigy0512" target="_blank">⌥ &nbsp; github.com/prodigy0512</a>
+    <a href="tel:7169301677">☎ &nbsp; (716) 930-1677</a>
+  </div>
+  <div class="footer-copy">© 2025 Nachiket Dabhade. All rights reserved.</div>
+</footer>
 
-            <div class="card">
-                <div class="card-image">
-                    <div class="card-icon">
-                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
-                        </svg>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-title">Heart Disease Prediction</div>
-                    <div class="card-description">
-                        Developed a predictive healthcare model using Logistic Regression &amp; XGBoost, improving 
-                        diagnostic accuracy by 25%. Built HIPAA-compliant data pipeline with MLflow and Streamlit.
-                    </div>
-                    <div class="card-tags">
-                        <span class="tag">Machine Learning</span>
-                        <span class="tag">XGBoost</span>
-                        <span class="tag">Streamlit</span>
-                    </div>
-                </div>
-            </div>
+<script>
+  // ─── SPLASH: lock body scroll during animation ───
+  const splash = document.getElementById('splash');
+  document.body.style.overflow = 'hidden';
 
-            <div class="card">
-                <div class="card-image">
-                    <div class="card-icon">
-                        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <rect x="3" y="3" width="7" height="7"></rect>
-                            <rect x="14" y="3" width="7" height="7"></rect>
-                            <rect x="14" y="14" width="7" height="7"></rect>
-                            <rect x="3" y="14" width="7" height="7"></rect>
-                        </svg>
-                    </div>
-                </div>
-                <div class="card-content">
-                    <div class="card-title">Person Re-Identification</div>
-                    <div class="card-description">
-                        Research on facial feature-based person re-identification for surveillance using Python, 
-                        TensorFlow, and OpenCV. Compared CNN, MTCNN, and HOG models with CNN yielding highest accuracy.
-                    </div>
-                    <div class="card-tags">
-                        <span class="tag">Deep Learning</span>
-                        <span class="tag">TensorFlow</span>
-                        <span class="tag">OpenCV</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
+  // ─── Play Netflix-style "tudum" boom via Web Audio ───
+  function playTudum() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      function tone(freq, start, dur, vol, type = 'sine') {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type = type;
+        o.frequency.setValueAtTime(freq, ctx.currentTime + start);
+        g.gain.setValueAtTime(0, ctx.currentTime + start);
+        g.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.025);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+        o.start(ctx.currentTime + start);
+        o.stop(ctx.currentTime + start + dur + 0.05);
+      }
+      // Deep resonant bass + harmonic shimmer
+      tone(55,  0.28, 1.5, 0.75);
+      tone(110, 0.28, 1.2, 0.40);
+      tone(220, 0.28, 0.9, 0.18, 'triangle');
+      tone(44,  0.30, 1.7, 0.55);
+    } catch(e) {}
+  }
 
-    <section class="section" id="skills">
-        <h2 class="section-title">Technical Skills</h2>
-        <div class="skills-grid">
-            <div class="skill-category">
-                <h3>Programming &amp; Scripting</h3>
-                <ul>
-                    <li>Python (Pandas, NumPy, PySpark)</li>
-                    <li>SQL</li>
-                    <li>R, MATLAB</li>
-                    <li>Shell Scripting</li>
-                </ul>
-            </div>
+  // Auto-play; if blocked by browser policy, fires on first interaction
+  let played = false;
+  function triggerSound() { if (!played) { played = true; playTudum(); } }
+  setTimeout(triggerSound, 60);
+  document.addEventListener('click',   triggerSound, { once: true });
+  document.addEventListener('keydown', triggerSound, { once: true });
 
-            <div class="skill-category">
-                <h3>Data Science &amp; ML</h3>
-                <ul>
-                    <li>Supervised &amp; Unsupervised Learning</li>
-                    <li>Deep Learning (TensorFlow, PyTorch)</li>
-                    <li>Feature Engineering</li>
-                    <li>Time Series Analysis</li>
-                </ul>
-            </div>
+  // Hide splash after CSS animation finishes (~4.1s)
+  setTimeout(() => {
+    splash.style.display = 'none';
+    document.body.style.overflow = '';
+  }, 4150);
 
-            <div class="skill-category">
-                <h3>Data Engineering</h3>
-                <ul>
-                    <li>ETL Pipelines (ADF, Airflow, Glue)</li>
-                    <li>Big Data (Spark, Databricks, Hadoop)</li>
-                    <li>Streaming (Kafka, Kinesis)</li>
-                    <li>Data Warehousing (Snowflake, Redshift)</li>
-                </ul>
-            </div>
+  // ─── Navbar scroll effect ───
+  const navbar = document.getElementById('navbar');
+  window.addEventListener('scroll', () => navbar.classList.toggle('scrolled', scrollY > 60));
 
-            <div class="skill-category">
-                <h3>Cloud &amp; DevOps</h3>
-                <ul>
-                    <li>AWS, Azure, GCP</li>
-                    <li>CI/CD (GitHub Actions, Jenkins)</li>
-                    <li>IaC (Terraform, CloudFormation)</li>
-                    <li>Docker, Kubernetes</li>
-                </ul>
-            </div>
-
-            <div class="skill-category">
-                <h3>Databases</h3>
-                <ul>
-                    <li>SQL (PostgreSQL, MySQL, Oracle)</li>
-                    <li>NoSQL (MongoDB, Cassandra)</li>
-                    <li>RDBMS Systems</li>
-                </ul>
-            </div>
-
-            <div class="skill-category">
-                <h3>BI &amp; Visualization</h3>
-                <ul>
-                    <li>Power BI</li>
-                    <li>Advanced Excel</li>
-                    <li>Data Modeling</li>
-                    <li>Dashboard Development</li>
-                </ul>
-            </div>
-        </div>
-    </section>
-
-    <section class="contact-section" id="contact">
-        <h2 class="section-title">Let's Connect</h2>
-        <p style="font-size: 18px; color: #b3b3b3; max-width: 600px; margin: 0 auto;">
-            I'm currently seeking opportunities in Data Engineering, Data Science, and Analytics. 
-            Let's discuss how I can contribute to your team!
-        </p>
-        <div class="contact-links">
-            <a href="mailto:nachiketdabhade5@gmail.com" class="contact-link">
-                📧 Email
-            </a>
-            <a href="https://linkedin.com/in/nachiketsdabhade" target="_blank" class="contact-link">
-                💼 LinkedIn
-            </a>
-            <a href="https://github.com/prodigy0512" target="_blank" class="contact-link">
-                🐱 GitHub
-            </a>
-            <a href="tel:+17169301677" class="contact-link">
-                📱 +1 716 930 1677
-            </a>
-        </div>
-    </section>
-
-    <footer>
-        <p>© 2025 Nachiket Dabhade. All rights reserved.</p>
-        <p style="margin-top: 10px; font-size: 12px;">MS in Engineering Science &amp; Data Science | University at Buffalo</p>
-    </footer>
-
-    <script>
-        const navbar = document.getElementById('navbar');
-        
-        window.addEventListener('scroll', () => {
-            if (window.scrollY > 50) {
-                navbar.classList.add('scrolled');
-            } else {
-                navbar.classList.remove('scrolled');
-            }
-        });
-
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
-                if (target) {
-                    target.scrollIntoView({
-                        behavior: 'smooth',
-                        block: 'start'
-                    });
-                }
-            });
-        });
-
-        // Resume download functionality
-        document.getElementById('downloadResume').addEventListener('click', function(e) {
-            e.preventDefault();
-            
-            // Create resume content
-            const resumeContent = `NACHIKET DABHADE
-Data Engineer | Data Scientist | Cloud & BI Specialist
-
-CONTACT
-Phone: +1 716 930 1677
-Email: nachiketdabhade5@gmail.com
-LinkedIn: linkedin.com/in/nachiketsdabhade
-GitHub: github.com/prodigy0512
-
-SUMMARY
-Data Engineer with 1.5+ years of experience in ETL pipelines, Azure cloud computing, machine learning, and web scraping. 
-Proficient in SQL, Data Modeling, ETL and Snowflake. Passionate about building scalable data solutions that drive business impact.
-
-EDUCATION
-University at Buffalo – SUNY, NY, USA
-MS in Engineering Science and Data Science | Jan 2024 - May 2025
-
-University of Mumbai, Mumbai, India
-BS in Computer Engineering | Jul 2017 - Jul 2021
-
-EXPERIENCE
-Tata Consultancy Services, Mumbai, India
-Technical Representative, Data Engineer | Sep 2021 – Jul 2023
-• Spearheaded global reporting and data optimization initiatives across EMEA, AMER, and APJ
-• Designed cost-optimized ETL pipeline using Azure Data Factory achieving 15% cost reduction
-• Developed interactive dashboards using Power BI and SQL for data modeling and visualization
-• Led A/B testing and KPI analysis to refine business intelligence strategies
-• Developed critical parts supply chain solution for Goodyear Tires during pandemic
-
-Shanti Industrial Services, Mumbai, India
-Technical Representative, Engineer | Sep 2020 – Dec 2023
-• Used project analytics and cost-performance data to optimize resource allocation
-• Increased production 5x through process optimization
-• Grew company turnover from ₹1 Cr to ₹6 Cr
-
-PROJECTS
-• Goodyear Tires Supply Chain – Real-time supply chain using Azure Data Factory, Event Hub, Stream Analytics
-• Supply Chain Risk Scoring Engine – ML analytics with Python, XGBoost, Kafka, and Hopsworks Feature Store
-• Web Scraping Solution – Python-based scraper processing 500,000+ data points daily
-• Heart Disease Prediction – Predictive model improving diagnostic accuracy by 25%
-
-SKILLS
-Programming: Python, SQL, R, MATLAB, Shell Scripting
-Data Science: Machine Learning, Deep Learning (TensorFlow, PyTorch), Feature Engineering
-Data Engineering: ETL Pipelines (Azure Data Factory, Airflow, AWS Glue), Big Data (Spark, Databricks, Hadoop)
-Cloud: AWS, Azure, GCP, Docker, Kubernetes, Terraform
-Databases: PostgreSQL, MySQL, Oracle, MongoDB, Cassandra, Snowflake, Redshift, BigQuery
-BI Tools: Power BI, Advanced Excel
-
-CERTIFICATIONS
-• Microsoft Certified: Azure Data Scientist Associate (DP-203) - Apr 2023
-• Microsoft Certified: Power BI Data Analyst Associate (DP-900) - Jun 2023
-• Microsoft Certified: Implementing Microsoft Azure Infrastructure Solutions - Aug 2024`;
-
-            // Create blob and download
-            const blob = new Blob([resumeContent], { type: 'text/plain' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'Nachiket_Dabhade_Resume.txt';
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-            
-            // Show notification
-            alert('Resume downloaded! Check your downloads folder.');
-        });
-
-        // Add download website button
-        window.addEventListener('load', function() {
-            const downloadBtn = document.createElement('button');
-            downloadBtn.innerHTML = '⬇️ Download Website Code';
-            downloadBtn.style.cssText = `
-                position: fixed;
-                bottom: 30px;
-                right: 30px;
-                padding: 15px 25px;
-                background: #e50914;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                font-size: 14px;
-                font-weight: bold;
-                cursor: pointer;
-                z-index: 10000;
-                box-shadow: 0 4px 12px rgba(229, 9, 20, 0.4);
-                transition: all 0.3s;
-            `;
-            
-            downloadBtn.onmouseover = function() {
-                this.style.transform = 'scale(1.05)';
-                this.style.boxShadow = '0 6px 16px rgba(229, 9, 20, 0.6)';
-            };
-            
-            downloadBtn.onmouseout = function() {
-                this.style.transform = 'scale(1)';
-                this.style.boxShadow = '0 4px 12px rgba(229, 9, 20, 0.4)';
-            };
-            
-            downloadBtn.onclick = function() {
-                const htmlContent = document.documentElement.outerHTML;
-                const blob = new Blob([htmlContent], { type: 'text/html' });
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'index.html';
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(a);
-                
-                alert('✅ Website code downloaded as index.html!\n\nYou can now:\n1. Upload this to GitHub\n2. Deploy to any hosting service\n3. Edit it in any text editor');
-            };
-            
-            document.body.appendChild(downloadBtn);
-        });
-    </script>
-
-<button style="position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; background: rgb(229, 9, 20); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; z-index: 10000; box-shadow: rgba(229, 9, 20, 0.6) 0px 6px 16px; transition: 0.3s; transform: scale(1.05);">⬇️ Download Website Code</button></body></html>
+  // ─── Scroll reveal ───
+  const observer = new IntersectionObserver(
+    entries => entries.forEach(e => e.isIntersecting && e.target.classList.add('visible')),
+    { threshold: 0.12, rootMargin: '0px 0px -40px 0px' }
+  );
+  document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+</script>
+</body>
+</html>
